@@ -72,32 +72,39 @@ VERDICT_EXPLAIN = (
 # 主題系統（含新手友善版、四季風景版）
 # ============================================================
 def detect_season_and_phase():
-    """用使用者本地時間推估季節與日夜階段。
-    Streamlit 跑在伺服器，伺服器時區不一定等於使用者，所以這裡用
-    瀏覽器端 JS 寫入 query param 的方式取得使用者本地時間；
-    若拿不到就退回伺服器時間。回傳 (季節, 日夜, 月, 時)。
+    """依使用者『所在地理位置 + 當地時間』推估季節與日夜階段。
+
+    v2.1 改進：不再只看瀏覽器時鐘，而是用 Geolocation 取得緯度/經度：
+      - 緯度決定半球：北半球與南半球季節相反（例如台灣冬天時，澳洲是夏天）。
+      - 經度估算當地時區時間：不同城市的當地時間不同 → 背景不同。
+      - 另回傳城市名(由前端反查)顯示在徽章上。
+    取不到定位時，退回瀏覽器本地時鐘。
+    回傳 (季節, 日夜, 月, 時, 城市名, 緯度)。
     """
-    # 嘗試從網址參數讀使用者本地時間（由下方 JS 注入）
     qp = st.query_params
     now = dt.datetime.now()
+
+    lat = None
+    city = qp.get("city", "")
     try:
-        if "lh" in qp and "lmon" in qp:
-            hour = int(qp["lh"])
-            month = int(qp["lmon"])
-        else:
-            hour, month = now.hour, now.month
-    except (ValueError, TypeError):
+        # 前端注入的當地時與月（已依經度換算）
+        hour = int(qp["lh"]) if "lh" in qp else now.hour
+        month = int(qp["lmon"]) if "lmon" in qp else now.month
+        if "lat" in qp:
+            lat = float(qp["lat"])
+    except (ValueError, TypeError, KeyError):
         hour, month = now.hour, now.month
 
-    # 北半球季節（台灣）
+    # 半球判斷季節（南半球月份對應的季節相反）
+    northern = lat is None or lat >= 0
     if month in (3, 4, 5):
-        season = "spring"
+        season = "spring" if northern else "autumn"
     elif month in (6, 7, 8):
-        season = "summer"
+        season = "summer" if northern else "winter"
     elif month in (9, 10, 11):
-        season = "autumn"
+        season = "autumn" if northern else "spring"
     else:
-        season = "winter"
+        season = "winter" if northern else "summer"
 
     if 5 <= hour < 11:
         phase = "morning"
@@ -107,7 +114,7 @@ def detect_season_and_phase():
         phase = "dusk"
     else:
         phase = "night"
-    return season, phase, month, hour
+    return season, phase, month, hour, city, lat
 
 
 # 四季 × 日夜 漸層配色（耐看、低飽和，避免干擾讀圖）
@@ -135,19 +142,50 @@ PHASE_LABEL = {"morning": "清晨", "day": "白天", "dusk": "黃昏", "night": 
 
 
 def inject_local_time_js():
-    """用一小段 JS 把使用者本地的時與月寫進網址參數，
-    這樣四季風景版才能依『使用者所在地的時間』而非伺服器時間變化。
-    只在尚未取得時注入，避免無限重整。"""
+    """請求瀏覽器地理定位，取得經緯度後：
+      - 用經度估算當地時區時間（每 15° ≈ 1 小時），寫入網址參數。
+      - 用免費反查 API 取得城市名（失敗不影響季節判斷）。
+    使用者拒絕授權時，退回瀏覽器本地時鐘。只在尚未取得時注入，避免無限重整。
+    """
     if "lh" not in st.query_params:
         st.markdown("""
         <script>
-        const d = new Date();
-        const p = new URLSearchParams(window.location.search);
-        if (!p.has('lh')) {
+        (function () {
+          const p = new URLSearchParams(window.location.search);
+          if (p.has('lh')) return;
+          function fallback() {
+            const d = new Date();
             p.set('lh', d.getHours());
             p.set('lmon', d.getMonth() + 1);
             window.location.search = p.toString();
-        }
+          }
+          function useCoords(lat, lon) {
+            // 以經度估當地時間：UTC 小時 + 經度/15
+            const nowUTC = new Date();
+            let localH = (nowUTC.getUTCHours() + lon / 15);
+            localH = ((Math.round(localH) % 24) + 24) % 24;
+            p.set('lh', localH);
+            p.set('lmon', nowUTC.getUTCMonth() + 1);
+            p.set('lat', lat.toFixed(2));
+            // 反查城市名（BigDataCloud 免費、免金鑰）
+            fetch('https://api.bigdatacloud.net/data/reverse-geocode-client?latitude='
+                  + lat + '&longitude=' + lon + '&localityLanguage=zh')
+              .then(r => r.json())
+              .then(j => {
+                const c = j.city || j.locality || j.principalSubdivision || '';
+                if (c) p.set('city', c);
+                window.location.search = p.toString();
+              })
+              .catch(() => { window.location.search = p.toString(); });
+          }
+          if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+              pos => useCoords(pos.coords.latitude, pos.coords.longitude),
+              fallback,
+              { timeout: 8000 }
+            );
+          } else { fallback(); }
+        })();
         </script>
         """, unsafe_allow_html=True)
 
@@ -172,12 +210,12 @@ def apply_theme(theme: str):
         up_color, down_color = "#16a34a", "#dc2626"
     elif theme == "四季風景版":
         inject_local_time_js()
-        season, phase, _, _ = detect_season_and_phase()
+        season, phase, _, _, city, _ = detect_season_and_phase()
         g1, g2, text_col = SEASON_GRADIENTS[(season, phase)]
         dark_phase = phase == "night" or (season == "autumn" and phase == "dusk")
         plot_template = "plotly_dark" if dark_phase else "plotly_white"
         css = _css_season(g1, g2, text_col, dark_phase)
-        st.session_state["_season_info"] = (season, phase)
+        st.session_state["_season_info"] = (season, phase, city)
     else:
         css = _css_dark()
 
@@ -208,18 +246,43 @@ def _css_dark():
     </style>"""
 
 
+def _force_text(color, muted, heading):
+    """產生一段「強制把 Streamlit 內建元件文字都上色」的 CSS 片段。
+    這是修正淺色/新手/四季版文字看不清的關鍵：Streamlit 的標題(h1~h6)、
+    內文、選單標籤都有自己的 class，光設 body 顏色蓋不到，需用 !important 明確指定。
+    color=主文字、muted=次要文字、heading=標題顏色。
+    """
+    return f"""
+    /* 主內容區所有文字 */
+    .stApp, .stApp p, .stApp li, .stApp span, .stApp label,
+    .stMarkdown, .stMarkdown p, .stMarkdown li,
+    [data-testid="stMarkdownContainer"] p,
+    [data-testid="stMarkdownContainer"] li,
+    [data-testid="stMarkdownContainer"] span {{ color:{color} !important; }}
+    /* 標題 h1~h6（st.subheader/st.header 都會變成這些） */
+    .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+    [data-testid="stHeading"] {{ color:{heading} !important; }}
+    /* 側邊欄文字 */
+    section[data-testid="stSidebar"] * {{ color:{color} !important; }}
+    /* 次要說明文字（st.caption） */
+    [data-testid="stCaptionContainer"], .stApp small {{ color:{muted} !important; }}
+    """
+
+
 def _css_light():
     return f"""<style>{_base_fonts()}
     .stApp {{ background:#f6f8fa; }}
-    html,body,[class*="css"] {{ font-family:'Lexend','Noto Sans TC',sans-serif; color:#1f2328; }}
-    .main-title {{ font-size:2.1rem; font-weight:700; color:#1f2328; margin-bottom:0; }}
-    .subtitle {{ color:#656d76; font-size:.95rem; margin-top:.2rem; }}
+    html,body,[class*="css"] {{ font-family:'Lexend','Noto Sans TC',sans-serif; }}
+    {_force_text("#1f2328", "#656d76", "#1f2328")}
+    .main-title {{ font-size:2.1rem; font-weight:700; color:#1f2328 !important; margin-bottom:0; }}
+    .subtitle {{ color:#656d76 !important; font-size:.95rem; margin-top:.2rem; }}
     .metric-card {{ background:#ffffff; border:1px solid #d0d7de; border-radius:14px;
       padding:1.1rem 1.3rem; box-shadow:0 1px 3px rgba(0,0,0,.06); }}
-    .metric-label {{ color:#656d76; font-size:.8rem; text-transform:uppercase; letter-spacing:1px; }}
-    .metric-value {{ font-family:'JetBrains Mono',monospace; font-size:1.7rem; color:#1f2328; margin-top:.2rem; }}
+    .metric-label {{ color:#656d76 !important; font-size:.8rem; text-transform:uppercase; letter-spacing:1px; }}
+    .metric-value {{ font-family:'JetBrains Mono',monospace; font-size:1.7rem; color:#1f2328 !important; margin-top:.2rem; }}
     .disclaimer {{ background:#fff8e1; border-left:3px solid #d4a72c;
-      padding:.7rem 1rem; border-radius:6px; color:#7a5c00; font-size:.85rem; }}
+      padding:.7rem 1rem; border-radius:6px; color:#7a5c00 !important; font-size:.9rem; line-height:1.7; }}
+    .disclaimer * {{ color:#7a5c00 !important; }}
     </style>"""
 
 
@@ -247,28 +310,34 @@ def _css_system():
 
 
 def _css_newbie():
-    # 乾淨、留白多、大字、柔和。給第一次看股市的人。
+    # 乾淨、留白多、大字、柔和。給第一次看股市的人。文字加深、對比拉高。
     return f"""<style>{_base_fonts()}
     .stApp {{ background:#fbfcfe; }}
-    html,body,[class*="css"] {{ font-family:'Noto Sans TC','Lexend',sans-serif; color:#2d3748; }}
-    .main-title {{ font-size:1.9rem; font-weight:700; color:#2b6cb0; margin-bottom:0; }}
-    .subtitle {{ color:#718096; font-size:1rem; margin-top:.3rem; }}
-    .metric-card {{ background:#fff; border:1px solid #e2e8f0; border-radius:18px;
-      padding:1.3rem 1.5rem; box-shadow:0 2px 10px rgba(43,108,176,.06); }}
-    .metric-label {{ color:#718096; font-size:.9rem; letter-spacing:.3px; }}
-    .metric-value {{ font-size:1.9rem; font-weight:700; color:#2d3748; margin-top:.3rem; }}
-    .disclaimer {{ background:#ebf8ff; border-left:4px solid #4299e1;
-      padding:.9rem 1.1rem; border-radius:10px; color:#2c5282; font-size:.95rem; line-height:1.7; }}
-    .newbie-tip {{ background:#f0fff4; border:1px solid #c6f6d5; border-radius:14px;
-      padding:1rem 1.2rem; margin:.5rem 0; color:#276749; line-height:1.8; }}
-    h2,h3 {{ color:#2b6cb0 !important; }}
+    html,body,[class*="css"] {{ font-family:'Noto Sans TC','Lexend',sans-serif; }}
+    {_force_text("#1a202c", "#4a5568", "#1e4d8b")}
+    .main-title {{ font-size:1.95rem; font-weight:700; color:#1e4d8b !important; margin-bottom:0; }}
+    .subtitle {{ color:#4a5568 !important; font-size:1rem; margin-top:.3rem; }}
+    .metric-card {{ background:#fff; border:1px solid #cbd5e0; border-radius:18px;
+      padding:1.3rem 1.5rem; box-shadow:0 2px 10px rgba(30,77,139,.08); }}
+    .metric-label {{ color:#4a5568 !important; font-size:.9rem; letter-spacing:.3px; }}
+    .metric-value {{ font-size:1.9rem; font-weight:700; color:#1a202c !important; margin-top:.3rem; }}
+    .disclaimer {{ background:#e7f0fb; border-left:4px solid #2b6cb0;
+      padding:.95rem 1.15rem; border-radius:10px; color:#1c3d5e !important; font-size:.98rem; line-height:1.8; }}
+    .disclaimer * {{ color:#1c3d5e !important; }}
+    .newbie-tip {{ background:#e9f9ef; border:1px solid #9ae6b4; border-radius:14px;
+      padding:1rem 1.2rem; margin:.5rem 0; color:#1c4532 !important; line-height:1.8; }}
+    .newbie-tip * {{ color:#1c4532 !important; }}
+    /* 展開元件(expander)標題也要看得清楚 */
+    .stExpander summary, .stExpander summary * {{ color:#1a202c !important; }}
     </style>"""
 
 
 def _css_season(g1, g2, text_col, dark_phase):
-    card_bg = "rgba(20,24,33,.55)" if dark_phase else "rgba(255,255,255,.55)"
-    border = "rgba(255,255,255,.18)" if dark_phase else "rgba(0,0,0,.08)"
-    # 動態漸層 + 緩慢飄移動畫（耐看，不刺眼）
+    # 卡片底色加深(0.72)讓文字更清楚；文字加陰影scrim避免融進背景
+    card_bg = "rgba(15,19,28,.72)" if dark_phase else "rgba(255,255,255,.78)"
+    border = "rgba(255,255,255,.25)" if dark_phase else "rgba(0,0,0,.12)"
+    shadow = ("0 1px 6px rgba(0,0,0,.55)" if dark_phase
+              else "0 1px 4px rgba(255,255,255,.7)")
     return f"""<style>{_base_fonts()}
     .stApp {{
       background:linear-gradient(135deg,{g1},{g2},{g1});
@@ -280,20 +349,28 @@ def _css_season(g1, g2, text_col, dark_phase):
       50% {{background-position:100% 50%;}}
       100% {{background-position:0% 50%;}}
     }}
-    html,body,[class*="css"] {{ font-family:'Noto Sans TC','Lexend',sans-serif; color:{text_col}; }}
-    .main-title {{ font-size:2.1rem; font-weight:700; color:{text_col}; margin-bottom:0;
-      text-shadow:0 1px 12px rgba(0,0,0,.12); }}
-    .subtitle {{ color:{text_col}; opacity:.78; font-size:.95rem; margin-top:.2rem; }}
-    .metric-card {{ background:{card_bg}; backdrop-filter:blur(12px);
-      -webkit-backdrop-filter:blur(12px); border:1px solid {border};
+    html,body,[class*="css"] {{ font-family:'Noto Sans TC','Lexend',sans-serif; }}
+    {_force_text(text_col, text_col, text_col)}
+    /* 在漸層上的文字統一加陰影，確保任何季節都看得清楚 */
+    .stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp p,.stApp li,.stApp label,
+    section[data-testid="stSidebar"] * {{ text-shadow:{shadow}; }}
+    .main-title {{ font-size:2.1rem; font-weight:700; color:{text_col} !important; margin-bottom:0; }}
+    .subtitle {{ color:{text_col} !important; opacity:.9; font-size:.95rem; margin-top:.2rem; }}
+    .metric-card {{ background:{card_bg}; backdrop-filter:blur(14px);
+      -webkit-backdrop-filter:blur(14px); border:1px solid {border};
       border-radius:16px; padding:1.1rem 1.3rem; }}
-    .metric-label {{ color:{text_col}; opacity:.65; font-size:.8rem; letter-spacing:1px; }}
-    .metric-value {{ font-family:'JetBrains Mono',monospace; font-size:1.7rem; color:{text_col}; margin-top:.2rem; }}
-    .disclaimer {{ background:{card_bg}; backdrop-filter:blur(8px); border-left:3px solid {text_col};
-      padding:.7rem 1rem; border-radius:10px; color:{text_col}; font-size:.85rem; }}
+    .metric-card * {{ text-shadow:none; }}
+    .metric-label {{ color:{text_col} !important; opacity:.8; font-size:.8rem; letter-spacing:1px; }}
+    .metric-value {{ font-family:'JetBrains Mono',monospace; font-size:1.7rem; color:{text_col} !important; margin-top:.2rem; }}
+    .disclaimer {{ background:{card_bg}; backdrop-filter:blur(10px); border-left:3px solid {text_col};
+      padding:.7rem 1rem; border-radius:10px; color:{text_col} !important; font-size:.9rem; line-height:1.7; }}
+    .disclaimer *, .newbie-tip * {{ text-shadow:none; color:{text_col} !important; }}
+    .newbie-tip {{ background:{card_bg}; backdrop-filter:blur(10px); border:1px solid {border};
+      border-radius:14px; padding:1rem 1.2rem; margin:.5rem 0; color:{text_col} !important; line-height:1.8; }}
     .season-badge {{ display:inline-block; background:{card_bg}; backdrop-filter:blur(8px);
-      border:1px solid {border}; border-radius:30px; padding:.3rem 1rem; color:{text_col};
+      border:1px solid {border}; border-radius:30px; padding:.3rem 1rem; color:{text_col} !important;
       font-size:.9rem; margin-bottom:.4rem; }}
+    .stExpander summary, .stExpander summary * {{ color:{text_col} !important; }}
     </style>"""
 
 
@@ -332,6 +409,38 @@ def get_last_updated():
     return None
 
 
+def _pct_over(closes, n):
+    """以往回第 n 個有效收盤為基準算到最新收盤的漲幅(%)。"""
+    if len(closes) <= n:
+        return None
+    base = closes.iloc[-1 - n]
+    if base == 0:
+        return None
+    return round((closes.iloc[-1] - base) / base * 100, 2)
+
+
+def _live_perf(df, code):
+    """彙總檔缺失時，直接從股價 df 現算各區間漲幅，回傳與彙總檔同欄位的 dict。"""
+    if df is None or df.empty:
+        return None
+    closes = df.dropna(subset=["Close"])["Close"].reset_index(drop=True)
+    if closes.empty:
+        return None
+    tmp = df.dropna(subset=["Close"]).copy()
+    tmp["Date"] = pd.to_datetime(tmp["Date"], errors="coerce")
+    yr = tmp["Date"].dt.year.max()
+    yr_rows = tmp[tmp["Date"].dt.year == yr]
+    ytd = None
+    if not yr_rows.empty and yr_rows.iloc[0]["Close"]:
+        ytd = round((closes.iloc[-1] - yr_rows.iloc[0]["Close"])
+                    / yr_rows.iloc[0]["Close"] * 100, 2)
+    return {
+        "name": code, "close": round(float(closes.iloc[-1]), 2),
+        "chg_prev_day": _pct_over(closes, 1), "chg_1w": _pct_over(closes, 5),
+        "chg_1m": _pct_over(closes, 21), "chg_ytd": ytd, "chg_1y": _pct_over(closes, 252),
+    }
+
+
 def fmt_pct(v):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return "—"
@@ -342,6 +451,19 @@ def pct_color(v, up, down):
     if v is None or (isinstance(v, float) and pd.isna(v)):
         return "#888"
     return up if v >= 0 else down
+
+
+def no_data_notice(what="股價"):
+    """資料尚未產生時的友善提示（取代原本一行紅字）。"""
+    st.warning(f"⏳ 目前還沒有{what}資料。")
+    st.markdown(
+        "這通常表示**爬蟲還沒在線上跑過第一次**。請依下列任一方式產生資料：\n\n"
+        "- **線上(建議)**：到 GitHub repo 的 **Actions** 分頁 → 「每日資料更新」→ "
+        "**Run workflow**，跑完約 3–8 分鐘後資料會自動出現，網站會自動重整。\n"
+        "- **本機**：依序執行 `python fetch_stock.py`、`python fetch_ptt.py`、"
+        "`python analyze_sentiment.py`，產生的 CSV 會放進 `data/` 資料夾。\n\n"
+        "（首次設定步驟詳見 README 第五節。本提示是正常流程，不是程式錯誤。）"
+    )
 
 
 # ============================================================
@@ -373,8 +495,9 @@ with st.sidebar:
     st.caption(f"📅 資料更新於：{lu}" if lu else "📅 資料更新時間：未知")
     st.caption("來源：yfinance（股價）+ PTT Stock 板（輿情）")
     if theme == "四季風景版" and "_season_info" in st.session_state:
-        s, p = st.session_state["_season_info"]
-        st.caption(f"目前情境：{SEASON_LABEL[s]} · {PHASE_LABEL[p]}（依你所在地時間）")
+        s, p, city = st.session_state["_season_info"]
+        loc = f"{city}· " if city else ""
+        st.caption(f"目前情境：{loc}{SEASON_LABEL[s]} · {PHASE_LABEL[p]}（依你所在城市與時間）")
 
 
 # ============================================================
@@ -382,8 +505,9 @@ with st.sidebar:
 # ============================================================
 def header():
     if theme == "四季風景版" and "_season_info" in st.session_state:
-        s, p = st.session_state["_season_info"]
-        st.markdown(f'<span class="season-badge">{SEASON_LABEL[s]} · {PHASE_LABEL[p]} 情境背景</span>',
+        s, p, city = st.session_state["_season_info"]
+        loc = f"{city} · " if city else ""
+        st.markdown(f'<span class="season-badge">📍 {loc}{SEASON_LABEL[s]} · {PHASE_LABEL[p]} 情境背景</span>',
                     unsafe_allow_html=True)
     st.markdown('<p class="main-title">📊 台美股輿情 × 量化趨勢分析</p>', unsafe_allow_html=True)
     st.markdown('<p class="subtitle">整合社群輿情情緒與技術指標的 ETF 趨勢分析系統 · 專題 v2</p>',
@@ -398,7 +522,7 @@ def page_single():
     header()
     stock = load_stock(TARGETS[target_name][0])
     if stock is None:
-        st.error(f"找不到 {TARGETS[target_name][0]}，請先執行 fetch_stock.py 產生 data/ 內的 CSV。")
+        no_data_notice(f"「{target_name}」的股價")
         st.stop()
 
     code = TARGETS[target_name][1]
@@ -409,14 +533,17 @@ def page_single():
     change = latest["Close"] - prev["Close"]
     change_pct = (change / prev["Close"] * 100) if prev["Close"] else 0
 
-    # 區間漲幅（從彙總檔取，取不到就現算）
+    # 區間漲幅（優先讀彙總檔；取不到就用本檔股價現算，確保有資料就有數值）
     perf = load_csv("performance_summary.csv")
     prow = None
     if perf is not None:
-        m = perf[perf["ticker"].astype(str).str.replace(".", "_", regex=False)
-                 .str.contains(code, case=False, na=False)]
+        clean = perf["ticker"].astype(str).str.replace(".", "_", regex=False)
+        m = perf[clean.str.fullmatch(f"{code}(_TW)?", case=False, na=False)]
         if not m.empty:
-            prow = m.iloc[0]
+            prow = m.iloc[0].to_dict()
+    if prow is None:
+        # 彙總檔缺失 → 直接用目前載入的整段股價現算各區間漲幅
+        prow = _live_perf(full, code)
 
     # 對應標的的輿情（優先用分標的檔）
     by_tgt = load_csv("daily_sentiment_by_target.csv")
@@ -588,7 +715,7 @@ def page_compare():
     st.subheader("📊 多標的區間漲幅比較")
     perf = load_csv("performance_summary.csv")
     if perf is None or perf.empty:
-        st.error("找不到 performance_summary.csv，請先執行 fetch_stock.py。")
+        no_data_notice("多標的比較所需的")
         st.stop()
 
     label_map = {"chg_prev_day": "前一交易日", "chg_1w": "近一週", "chg_1m": "近一月",
@@ -682,7 +809,7 @@ def page_overview():
                            margin=dict(t=20, b=10), xaxis_title="今年以來 %")
         st.plotly_chart(ofig, width='stretch')
     else:
-        st.info("尚無彙總資料，請先執行 fetch_stock.py。")
+        no_data_notice("市場總覽所需的")
 
     # 全市場每日情緒
     if daily_sent is not None and not daily_sent.empty:
