@@ -29,11 +29,13 @@ jobs:
         run: python fetch_stock.py
 
       - name: fetch ptt
+        continue-on-error: true
         env:
           PAGES_TO_CRAWL: "8"
         run: python fetch_ptt.py
 
       - name: analyze sentiment
+        continue-on-error: true
         run: python analyze_sentiment.py
 
       - name: commit data
