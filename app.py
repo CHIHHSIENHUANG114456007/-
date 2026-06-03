@@ -159,13 +159,15 @@ def request_geolocation():
         # 座標有變動才反查城市，避免每次重跑都打 API
         if prev.get("lat") != lat or prev.get("lon") != lon:
             city = _reverse_geocode(lat, lon)
-            st.session_state["_geo"] = {"lat": lat, "lon": lon, "city": city}
+            city_en = _reverse_geocode_en(lat, lon)
+            st.session_state["_geo"] = {"lat": lat, "lon": lon,
+                                        "city": city, "city_en": city_en}
             st.rerun()
 
 
 @st.cache_data(show_spinner=False)
 def _reverse_geocode(lat, lon):
-    """用免費、免金鑰的 BigDataCloud API 把座標反查成城市名。失敗回空字串。"""
+    """用免費、免金鑰的 BigDataCloud API 把座標反查成城市名（中文）。失敗回空字串。"""
     try:
         import requests
         r = requests.get(
@@ -176,6 +178,62 @@ def _reverse_geocode(lat, lon):
         return j.get("city") or j.get("locality") or j.get("principalSubdivision") or ""
     except Exception:
         return ""
+
+
+@st.cache_data(show_spinner=False)
+def _reverse_geocode_en(lat, lon):
+    """另取英文城市名，給 Unsplash 搜尋用（英文關鍵字命中率較高）。"""
+    try:
+        import requests
+        r = requests.get(
+            "https://api.bigdatacloud.net/data/reverse-geocode-client",
+            params={"latitude": lat, "longitude": lon, "localityLanguage": "en"},
+            timeout=6)
+        j = r.json()
+        return j.get("city") or j.get("locality") or j.get("principalSubdivision") or ""
+    except Exception:
+        return ""
+
+
+# 時段 → 英文關鍵字（給 Unsplash 搜尋；對應視覺氛圍）
+PHASE_EN = {"morning": "sunrise morning", "day": "daytime street",
+            "dusk": "sunset dusk", "night": "night cityscape lights"}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_city_photo(city_en, phase, key):
+    """用 Unsplash 依『城市 + 時段』搜尋一張橫向風景照，回傳圖片 URL。
+    一小時內同樣的城市+時段會走快取(ttl=3600)，避免重複打 API。
+    沒有金鑰或失敗時回傳 None（呼叫端會退回漸層背景）。"""
+    if not key or not city_en:
+        return None
+    try:
+        import requests
+        query = f"{city_en} {PHASE_EN.get(phase, 'cityscape')}"
+        r = requests.get(
+            "https://api.unsplash.com/search/photos",
+            params={"query": query, "orientation": "landscape", "per_page": 10},
+            headers={"Authorization": f"Client-ID {key}"},
+            timeout=8)
+        if r.status_code != 200:
+            return None
+        results = r.json().get("results", [])
+        if not results:
+            return None
+        # 從前幾張裡隨機挑一張，達成你要的「每次隨機」效果
+        import random
+        pick = random.choice(results[:min(10, len(results))])
+        return pick["urls"]["regular"]
+    except Exception:
+        return None
+
+
+def get_unsplash_key():
+    """從 Streamlit Secrets 讀 Unsplash 金鑰；沒設定就回 None（不報錯）。"""
+    try:
+        return st.secrets.get("UNSPLASH_ACCESS_KEY")
+    except Exception:
+        return None
 
 
 def apply_theme(theme: str):
@@ -202,7 +260,13 @@ def apply_theme(theme: str):
         g1, g2, text_col = SEASON_GRADIENTS[(season, phase)]
         dark_phase = phase == "night" or (season == "autumn" and phase == "dusk")
         plot_template = "plotly_dark" if dark_phase else "plotly_white"
-        css = _css_season(g1, g2, text_col, dark_phase)
+        # 嘗試抓該城市+時段的真實風景照當背景；失敗則用漸層
+        geo = st.session_state.get("_geo") or {}
+        photo = fetch_city_photo(geo.get("city_en", ""), phase, get_unsplash_key())
+        if photo:
+            css = _css_season_photo(photo, dark_phase)
+        else:
+            css = _css_season(g1, g2, text_col, dark_phase)
         st.session_state["_season_info"] = (season, phase, city)
     else:
         css = _css_dark()
@@ -362,10 +426,52 @@ def _css_season(g1, g2, text_col, dark_phase):
     </style>"""
 
 
-# ============================================================
-# 資料載入
-# ============================================================
-def dpath(name):
+def _css_season_photo(photo_url, dark_phase):
+    """真實城市風景照當全螢幕固定背景，疊一層半透明遮罩(scrim)讓文字清楚。
+    夜晚時段用暗色遮罩 + 白字；白天用亮色遮罩 + 深字。卡片用毛玻璃。"""
+    if dark_phase:
+        scrim = "linear-gradient(rgba(10,12,20,.62), rgba(10,12,20,.72))"
+        text_col = "#f5f7fa"
+        card_bg = "rgba(15,19,28,.62)"
+        border = "rgba(255,255,255,.22)"
+        shadow = "0 1px 8px rgba(0,0,0,.7)"
+    else:
+        scrim = "linear-gradient(rgba(255,255,255,.55), rgba(255,255,255,.68))"
+        text_col = "#1a2330"
+        card_bg = "rgba(255,255,255,.72)"
+        border = "rgba(0,0,0,.12)"
+        shadow = "0 1px 4px rgba(255,255,255,.8)"
+    return f"""<style>{_base_fonts()}
+    .stApp {{
+      background:{scrim}, url('{photo_url}');
+      background-size:cover, cover;
+      background-position:center center;
+      background-attachment:fixed, fixed;
+      background-repeat:no-repeat;
+    }}
+    html,body,[class*="css"] {{ font-family:'Noto Sans TC','Lexend',sans-serif; }}
+    {_force_text(text_col, text_col, text_col)}
+    .stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp p,.stApp li,.stApp label,
+    section[data-testid="stSidebar"] * {{ text-shadow:{shadow}; }}
+    .main-title {{ font-size:2.1rem; font-weight:700; color:{text_col} !important; margin-bottom:0; }}
+    .subtitle {{ color:{text_col} !important; opacity:.92; font-size:.95rem; margin-top:.2rem; }}
+    section[data-testid="stSidebar"] {{ background:{card_bg}; backdrop-filter:blur(14px); }}
+    .metric-card {{ background:{card_bg}; backdrop-filter:blur(14px);
+      -webkit-backdrop-filter:blur(14px); border:1px solid {border};
+      border-radius:16px; padding:1.1rem 1.3rem; }}
+    .metric-card * {{ text-shadow:none; }}
+    .metric-label {{ color:{text_col} !important; opacity:.8; font-size:.8rem; letter-spacing:1px; }}
+    .metric-value {{ font-family:'JetBrains Mono',monospace; font-size:1.7rem; color:{text_col} !important; margin-top:.2rem; }}
+    .disclaimer {{ background:{card_bg}; backdrop-filter:blur(10px); border-left:3px solid {text_col};
+      padding:.7rem 1rem; border-radius:10px; color:{text_col} !important; font-size:.9rem; line-height:1.7; }}
+    .disclaimer *, .newbie-tip * {{ text-shadow:none; color:{text_col} !important; }}
+    .newbie-tip {{ background:{card_bg}; backdrop-filter:blur(10px); border:1px solid {border};
+      border-radius:14px; padding:1rem 1.2rem; margin:.5rem 0; color:{text_col} !important; line-height:1.8; }}
+    .season-badge {{ display:inline-block; background:{card_bg}; backdrop-filter:blur(8px);
+      border:1px solid {border}; border-radius:30px; padding:.3rem 1rem; color:{text_col} !important;
+      font-size:.9rem; margin-bottom:.4rem; }}
+    .stExpander summary, .stExpander summary * {{ color:{text_col} !important; }}
+    </style>"""
     """優先讀 data/ 下的檔；找不到再退回同層（向下相容 v1）。"""
     p = os.path.join(DATA_DIR, name)
     return p if os.path.exists(p) else name
