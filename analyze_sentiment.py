@@ -56,11 +56,14 @@ def main():
     try:
         df = pd.read_csv(INPUT_CSV, encoding="utf-8-sig")
     except FileNotFoundError:
-        print(f"[錯誤] 找不到 {INPUT_CSV}，請先執行 fetch_ptt.py。")
-        sys.exit(1)
+        # 找不到 PTT 資料時，正常結束（exit 0）而非報錯中斷整個流程。
+        # 常見原因：PTT 在海外伺服器(GitHub Actions)連線被限制，fetch_ptt 沒抓到文章。
+        # 股價資料不受影響，情緒分析待 PTT 可連線時再補。
+        print(f"[略過] 找不到 {INPUT_CSV}（PTT 可能未成功抓取），跳過情緒分析。")
+        return
     if df.empty:
-        print("[錯誤] ptt_stock.csv 是空的，沒有文章可分析。")
-        sys.exit(1)
+        print("[略過] ptt_stock.csv 是空的，沒有文章可分析，跳過情緒分析。")
+        return
 
     print(f">> 讀入 {len(df)} 篇文章，開始情緒分析...")
     clf = load_classifier()
