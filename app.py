@@ -472,6 +472,12 @@ def _css_season_photo(photo_url, dark_phase):
       font-size:.9rem; margin-bottom:.4rem; }}
     .stExpander summary, .stExpander summary * {{ color:{text_col} !important; }}
     </style>"""
+
+
+# ============================================================
+# 資料載入
+# ============================================================
+def dpath(name):
     """優先讀 data/ 下的檔；找不到再退回同層（向下相容 v1）。"""
     p = os.path.join(DATA_DIR, name)
     return p if os.path.exists(p) else name
