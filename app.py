@@ -74,28 +74,26 @@ VERDICT_EXPLAIN = (
 def detect_season_and_phase():
     """依使用者『所在地理位置 + 當地時間』推估季節與日夜階段。
 
-    v2.1 改進：不再只看瀏覽器時鐘，而是用 Geolocation 取得緯度/經度：
-      - 緯度決定半球：北半球與南半球季節相反（例如台灣冬天時，澳洲是夏天）。
-      - 經度估算當地時區時間：不同城市的當地時間不同 → 背景不同。
-      - 另回傳城市名(由前端反查)顯示在徽章上。
-    取不到定位時，退回瀏覽器本地時鐘。
-    回傳 (季節, 日夜, 月, 時, 城市名, 緯度)。
+    座標由 streamlit-geolocation 元件取得後存在 st.session_state['_geo']；
+    取不到時退回伺服器/瀏覽器時鐘的月份與當下時段。
+    回傳 (季節, 日夜, 城市名, 緯度)。
     """
-    qp = st.query_params
     now = dt.datetime.now()
+    geo = st.session_state.get("_geo")  # {'lat':.., 'lon':.., 'city':..} 或 None
 
     lat = None
-    city = qp.get("city", "")
-    try:
-        # 前端注入的當地時與月（已依經度換算）
-        hour = int(qp["lh"]) if "lh" in qp else now.hour
-        month = int(qp["lmon"]) if "lmon" in qp else now.month
-        if "lat" in qp:
-            lat = float(qp["lat"])
-    except (ValueError, TypeError, KeyError):
+    city = ""
+    if geo and geo.get("lat") is not None:
+        lat = float(geo["lat"])
+        city = geo.get("city", "") or ""
+        lon = float(geo["lon"]) if geo.get("lon") is not None else 0.0
+        # 以經度估當地時間（每 15 度約 1 小時）
+        utc_h = dt.datetime.now(dt.timezone.utc).hour
+        hour = int((utc_h + lon / 15) % 24)
+        month = now.month
+    else:
         hour, month = now.hour, now.month
 
-    # 半球判斷季節（南半球月份對應的季節相反）
     northern = lat is None or lat >= 0
     if month in (3, 4, 5):
         season = "spring" if northern else "autumn"
@@ -114,7 +112,7 @@ def detect_season_and_phase():
         phase = "dusk"
     else:
         phase = "night"
-    return season, phase, month, hour, city, lat
+    return season, phase, city, lat
 
 
 # 四季 × 日夜 漸層配色（耐看、低飽和，避免干擾讀圖）
@@ -141,53 +139,43 @@ SEASON_LABEL = {"spring": "🌸 春", "summer": "🌊 夏", "autumn": "🍁 秋"
 PHASE_LABEL = {"morning": "清晨", "day": "白天", "dusk": "黃昏", "night": "夜晚"}
 
 
-def inject_local_time_js():
-    """請求瀏覽器地理定位，取得經緯度後：
-      - 用經度估算當地時區時間（每 15° ≈ 1 小時），寫入網址參數。
-      - 用免費反查 API 取得城市名（失敗不影響季節判斷）。
-    使用者拒絕授權時，退回瀏覽器本地時鐘。只在尚未取得時注入，避免無限重整。
-    """
-    if "lh" not in st.query_params:
-        st.markdown("""
-        <script>
-        (function () {
-          const p = new URLSearchParams(window.location.search);
-          if (p.has('lh')) return;
-          function fallback() {
-            const d = new Date();
-            p.set('lh', d.getHours());
-            p.set('lmon', d.getMonth() + 1);
-            window.location.search = p.toString();
-          }
-          function useCoords(lat, lon) {
-            // 以經度估當地時間：UTC 小時 + 經度/15
-            const nowUTC = new Date();
-            let localH = (nowUTC.getUTCHours() + lon / 15);
-            localH = ((Math.round(localH) % 24) + 24) % 24;
-            p.set('lh', localH);
-            p.set('lmon', nowUTC.getUTCMonth() + 1);
-            p.set('lat', lat.toFixed(2));
-            // 反查城市名（BigDataCloud 免費、免金鑰）
-            fetch('https://api.bigdatacloud.net/data/reverse-geocode-client?latitude='
-                  + lat + '&longitude=' + lon + '&localityLanguage=zh')
-              .then(r => r.json())
-              .then(j => {
-                const c = j.city || j.locality || j.principalSubdivision || '';
-                if (c) p.set('city', c);
-                window.location.search = p.toString();
-              })
-              .catch(() => { window.location.search = p.toString(); });
-          }
-          if (navigator.geolocation) {
-            navigator.geolocation.getCurrentPosition(
-              pos => useCoords(pos.coords.latitude, pos.coords.longitude),
-              fallback,
-              { timeout: 8000 }
-            );
-          } else { fallback(); }
-        })();
-        </script>
-        """, unsafe_allow_html=True)
+def request_geolocation():
+    """用 streamlit-geolocation 元件請求瀏覽器定位（會在元件 iframe 內執行，
+    腳本能正常跑、且帶 allow=geolocation，因此手機/電腦都會跳出授權詢問）。
+    取得座標後反查城市名，存進 st.session_state['_geo']。
+    若套件未安裝或使用者未授權，靜默退回時鐘判斷。"""
+    try:
+        from streamlit_geolocation import streamlit_geolocation
+    except Exception:
+        st.info("（四季風景版的定位功能需要 streamlit-geolocation 套件；"
+                "目前以裝置時間判斷季節。）")
+        return
+
+    st.caption("點下方圖示，允許定位後背景會依你的城市與當地時間變化：")
+    loc = streamlit_geolocation()
+    if loc and loc.get("latitude") is not None:
+        lat, lon = loc["latitude"], loc["longitude"]
+        prev = st.session_state.get("_geo") or {}
+        # 座標有變動才反查城市，避免每次重跑都打 API
+        if prev.get("lat") != lat or prev.get("lon") != lon:
+            city = _reverse_geocode(lat, lon)
+            st.session_state["_geo"] = {"lat": lat, "lon": lon, "city": city}
+            st.rerun()
+
+
+@st.cache_data(show_spinner=False)
+def _reverse_geocode(lat, lon):
+    """用免費、免金鑰的 BigDataCloud API 把座標反查成城市名。失敗回空字串。"""
+    try:
+        import requests
+        r = requests.get(
+            "https://api.bigdatacloud.net/data/reverse-geocode-client",
+            params={"latitude": lat, "longitude": lon, "localityLanguage": "zh"},
+            timeout=6)
+        j = r.json()
+        return j.get("city") or j.get("locality") or j.get("principalSubdivision") or ""
+    except Exception:
+        return ""
 
 
 def apply_theme(theme: str):
@@ -209,8 +197,8 @@ def apply_theme(theme: str):
         plot_template = "plotly_white"
         up_color, down_color = "#16a34a", "#dc2626"
     elif theme == "四季風景版":
-        inject_local_time_js()
-        season, phase, _, _, city, _ = detect_season_and_phase()
+        request_geolocation()
+        season, phase, city, _ = detect_season_and_phase()
         g1, g2, text_col = SEASON_GRADIENTS[(season, phase)]
         dark_phase = phase == "night" or (season == "autumn" and phase == "dusk")
         plot_template = "plotly_dark" if dark_phase else "plotly_white"
